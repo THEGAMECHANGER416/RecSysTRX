@@ -13,17 +13,25 @@ class RatingsDataPreprocessor(DataPreprocessor):
 
     def transform(self):
         """
-        Perform transformations like data normalization.
+        Perform transformations like data normalization at the user level.
+        Normalize ratings within each user.
         """
-        min_rating = self.df["rating"].min()
-        max_rating = self.df["rating"].max()
-        if max_rating == min_rating:
-            print("[Transform] Skipping normalization (all ratings are the same).")
-            return
+        print("[Transform] Normalizing ratings at userId level")
+
+        # Normalize ratings within each userId group
         self.df = self.df.with_columns(
-            ((pl.col("rating") - min_rating) / (max_rating - min_rating)).alias("rating")
+            pl.when(pl.col("rating").max().over("userId") == pl.col("rating").min().over("userId"))
+            .then(0)
+            .otherwise(
+                (pl.col("rating") - pl.col("rating").min().over("userId")) /
+                (pl.col("rating").max().over("userId") - pl.col("rating").min().over("userId"))
+            )
+            .alias("rating")
         )
-        print(f"[Transform] Normalized ratings to range [0, 1].")
+
+        print("[Transform] Normalized ratings at the user level.")
+
+
 
     def handle_missing_values(self):
         """

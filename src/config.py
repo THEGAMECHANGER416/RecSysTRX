@@ -13,3 +13,8 @@ FAISS_INDEX_TYPE = "IndexFlatIP"  # or "IndexFlatL2"
 
 # Output
 TOP_K = 10  # Number of recommendations to retrieve
+
+# ALS Settings
+ALS_FACTORS = 64
+ALS_ITERATIONS = 15
+ALS_REGULARIZATION = 0.1

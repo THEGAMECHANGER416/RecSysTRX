@@ -1,9 +1,12 @@
 from .base import BaseRecommender
 from src.data_loader import CSVDataLoader
 from src.data_preprocessing import RatingsDataPreprocessor
-from src.config import RATINGS_FILE
+from src.config import RATINGS_FILE, ALS_REGULARIZATION, ALS_ITERATIONS, ALS_FACTORS
 import faiss
 import numpy as np
+from implicit.als import AlternatingLeastSquares
+import polars as pl
+from scipy.sparse import csr_matrix
 
 class UserUserRecommender(BaseRecommender):
     def __init__(self, ratings_path: str = RATINGS_FILE):
@@ -13,13 +16,21 @@ class UserUserRecommender(BaseRecommender):
         :param ratings_path: Path to the ratings data file (default is RATINGS_FILE from config)
         """
         self.ratings_path = ratings_path
-        self.ratings_df = CSVDataLoader(self.ratings_path).load_data()
-        self.ratings_df = self.preprocess_data(self.ratings_df)
+        self.ratings_df = CSVDataLoader(self.ratings_path).load_data(["userId","movieId","rating"])
+        self.ratings_df = self._preprocess_data(self.ratings_df)
 
         self.user_similarity_index = None
         self.user_vectors = None
+
+        self.user_id_to_index = None
+        self.index_to_user_id = None
+
+        self.movie_id_to_index = None
+        self.index_to_movie_id = None
+
+        self.als_model = None
     
-    def preprocess_data(self, ratings_df):
+    def _preprocess_data(self, ratings_df):
         preprocessor = RatingsDataPreprocessor(ratings_df)
         preprocessor.clean()
         preprocessor.handle_missing_values()
@@ -32,31 +43,56 @@ class UserUserRecommender(BaseRecommender):
         
         This should create the FAISS index for fast user similarity lookup.
         """
-        print("Building user-user similarity model using FAISS...")
+        print("[Build Model] Fitting ALS for User Embeddings")
+        self.user_vectors = self._prepare_user_vectors(self.ratings_df)
+        print(f"[Build Model] Successfully built User Embedding of shape {self.user_vectors.shape}")
 
-        # TODO: Step 1 - Prepare user feature vectors (e.g., matrix of user ratings)
-        # You can convert the ratings_df into a suitable format (e.g., sparse matrix or dense vectors)
 
-        # Stub: Prepare user vectors (this is where you'll compute the user feature vectors)
-        self.user_vectors = self.prepare_user_vectors(self.ratings_df)
-        
         # TODO: Step 2 - Use FAISS to build the similarity index (e.g., using cosine or Euclidean distance)
-        self.user_similarity_index = self.build_faiss_index(self.user_vectors)
+        self.user_similarity_index = self._build_faiss_index(self.user_vectors)
         print("User-user similarity model built.")
 
-    def prepare_user_vectors(self, ratings_df):
-        """
-        Convert the ratings DataFrame into user vectors that can be used for similarity calculations.
-        
-        :param ratings_df: DataFrame containing user-item ratings
-        :return: A NumPy array of user vectors
-        """
-        # TODO: Implement this method to create feature vectors from the ratings dataframe
-        print("Preparing user vectors...")
-        # For now, returning random vectors as a placeholder
-        return np.random.rand(100, 50)  # Placeholder: 100 users, 50 features per user
+    def _prepare_user_vectors(self, ratings_df):
+        # Convert to efficient types
+        ratings_df = ratings_df.with_columns([
+            pl.col("userId").cast(pl.UInt32),
+            pl.col("movieId").cast(pl.UInt32),
+            pl.col("rating").cast(pl.Float32)
+        ])
 
-    def build_faiss_index(self, user_vectors):
+        # Create user and movie ID mappings
+        unique_users = ratings_df["userId"].unique().sort().to_list()
+        unique_movies = ratings_df["movieId"].unique().sort().to_list()
+
+        self.user_id_to_index = {user_id: idx for idx, user_id in enumerate(unique_users)}
+        self.index_to_user_id = {v: k for k, v in self.user_id_to_index.items()}
+
+        self.movie_id_to_index = {movie_id: idx for idx, movie_id in enumerate(unique_movies)}
+        self.index_to_movie_id = {v: k for k, v in self.movie_id_to_index.items()}
+
+        # Map original IDs to contiguous indices
+        user_indices = ratings_df.select(
+            pl.col("userId").replace(self.user_id_to_index)
+        ).to_numpy().flatten()
+        
+        movie_indices = ratings_df.select(
+            pl.col("movieId").replace(self.movie_id_to_index)
+        ).to_numpy().flatten()
+
+        # Build sparse matrix with correct dimensions
+        sparse_matrix = csr_matrix(
+            (ratings_df["rating"].to_numpy(), (user_indices, movie_indices)),
+            shape=(len(unique_users), ratings_df["movieId"].max() + 1),
+            dtype=np.float32
+        )
+
+        # Train ALS
+        self.als_model = AlternatingLeastSquares(factors=ALS_FACTORS, iterations=ALS_ITERATIONS, regularization=ALS_ITERATIONS)
+        self.als_model.fit(sparse_matrix)
+        
+        return self.als_model.user_factors
+
+    def _build_faiss_index(self, user_vectors):
         """
         Build a FAISS index for user-user similarity based on feature vectors.
         
@@ -82,15 +118,15 @@ class UserUserRecommender(BaseRecommender):
         print(f"Running inference for user {user_id}...")
         
         # TODO: Step 1 - Get the feature vector for the given user
-        user_vector = self.get_user_vector(user_id)
+        user_vector = self._get_user_vector(user_id)
         
         # TODO: Step 2 - Use the FAISS index to find similar users
-        similar_users = self.get_similar_users(user_vector, k)
+        similar_users = self._get_similar_users(user_vector, k)
         
         # TODO: Step 3 - Return similar user IDs (or actual recommendations)
         return similar_users
 
-    def get_user_vector(self, user_id: int):
+    def _get_user_vector(self, user_id: int):
         """
         Get the feature vector for a given user.
         
@@ -101,7 +137,7 @@ class UserUserRecommender(BaseRecommender):
         print(f"Getting vector for user {user_id}...")
         return np.random.rand(1, 50)  # Placeholder: Return random vector for now
 
-    def get_similar_users(self, user_vector, k):
+    def _get_similar_users(self, user_vector, k):
         """
         Get the most similar users to the given user.
 
