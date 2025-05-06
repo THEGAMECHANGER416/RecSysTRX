@@ -1,23 +1,23 @@
 from .base import BaseRecommender
 from src.data_loader import CSVDataLoader
 from src.data_preprocessing import RatingsDataPreprocessor
-from src.config import RATINGS_FILE, ALS_REGULARIZATION, ALS_ITERATIONS, ALS_FACTORS
-import faiss
+from src.config import *
 import numpy as np
 from implicit.als import AlternatingLeastSquares
 import polars as pl
 from scipy.sparse import csr_matrix
+import hnswlib
+import pickle
 
 class UserUserRecommender(BaseRecommender):
-    def __init__(self, ratings_path: str = RATINGS_FILE):
+    def __init__(self):
         """
         Initialize the recommender system.
         
         :param ratings_path: Path to the ratings data file (default is RATINGS_FILE from config)
         """
-        self.ratings_path = ratings_path
-        self.ratings_df = CSVDataLoader(self.ratings_path).load_data(["userId","movieId","rating"])
-        self.ratings_df = self._preprocess_data(self.ratings_df)
+        self.ratings_df = None
+        self.user_ratings_dict = None
 
         self.user_similarity_index = None
         self.user_vectors = None
@@ -30,29 +30,14 @@ class UserUserRecommender(BaseRecommender):
 
         self.als_model = None
     
-    def _preprocess_data(self, ratings_df):
+    def __preprocess_data(self, ratings_df):
         preprocessor = RatingsDataPreprocessor(ratings_df)
         preprocessor.clean()
         preprocessor.handle_missing_values()
         preprocessor.transform()
         return preprocessor.df
         
-    def build_model(self):
-        """
-        Build the user-user similarity model using FAISS.
-        
-        This should create the FAISS index for fast user similarity lookup.
-        """
-        print("[Build Model] Fitting ALS for User Embeddings")
-        self.user_vectors = self._prepare_user_vectors(self.ratings_df)
-        print(f"[Build Model] Successfully built User Embedding of shape {self.user_vectors.shape}")
-
-
-        # TODO: Step 2 - Use FAISS to build the similarity index (e.g., using cosine or Euclidean distance)
-        self.user_similarity_index = self._build_faiss_index(self.user_vectors)
-        print("User-user similarity model built.")
-
-    def _prepare_user_vectors(self, ratings_df):
+    def __prepare_user_vectors(self, ratings_df):
         # Convert to efficient types
         ratings_df = ratings_df.with_columns([
             pl.col("userId").cast(pl.UInt32),
@@ -82,7 +67,7 @@ class UserUserRecommender(BaseRecommender):
         # Build sparse matrix with correct dimensions
         sparse_matrix = csr_matrix(
             (ratings_df["rating"].to_numpy(), (user_indices, movie_indices)),
-            shape=(len(unique_users), ratings_df["movieId"].max() + 1),
+            shape=(len(unique_users), len(unique_movies)),
             dtype=np.float32
         )
 
@@ -92,60 +77,268 @@ class UserUserRecommender(BaseRecommender):
         
         return self.als_model.user_factors
 
-    def _build_faiss_index(self, user_vectors):
+    def __build_hnsw_index(self, user_vectors):
         """
-        Build a FAISS index for user-user similarity based on feature vectors.
+        Builds an HNSW index for approximate nearest neighbor search of user vectors.
         
-        :param user_vectors: NumPy array containing user feature vectors
-        :return: FAISS index
+        :param user_vectors: NumPy array of shape (num_users, embedding_dim)
         """
-        # TODO: Implement this method to build a FAISS index
-        print("Building FAISS index...")
-        # Stub: Using FAISS's L2 distance index as an example
-        dim = user_vectors.shape[1]
-        index = faiss.IndexFlatL2(dim)
-        index.add(user_vectors.astype(np.float32))  # Add user vectors to FAISS index
-        return index
+        # Normalize vectors for cosine similarity
+        user_vectors = np.ascontiguousarray(user_vectors)
+        norms = np.linalg.norm(user_vectors, axis=1, keepdims=True)
+        user_vectors_normalized = user_vectors / np.where(norms == 0, 1e-10, norms)
 
-    def inference(self, user_id: int, k: int = 5):
-        """
-        Perform inference to recommend similar users to the given user.
-
-        :param user_id: The user for whom to find similar users
-        :param k: The number of similar users to return (default 5)
-        :return: A list of recommended user IDs (similar users)
-        """
-        print(f"Running inference for user {user_id}...")
+        # Initialize index
+        dim = user_vectors_normalized.shape[1]
+        self.user_similarity_index = hnswlib.Index(space=HNSW_INDEX_SPACE, dim=dim)
         
-        # TODO: Step 1 - Get the feature vector for the given user
-        user_vector = self._get_user_vector(user_id)
+        # For 1M+ users: M=32, ef_construction=200 provides good quality/speed balance
+        self.user_similarity_index.init_index(
+            max_elements=len(user_vectors_normalized),
+            ef_construction=HNSW_INDEX_EF_BUILD,
+            M=HNSW_INDEX_M
+        )
         
-        # TODO: Step 2 - Use the FAISS index to find similar users
-        similar_users = self._get_similar_users(user_vector, k)
+        # Add items in batches for large datasets
+        batch_size = HNSW_BATCH_SIZE
+        for i in range(0, len(user_vectors_normalized), batch_size):
+            end_idx = min(i + batch_size, len(user_vectors_normalized))
+            batch = user_vectors_normalized[i:end_idx]
+            self.user_similarity_index.add_items(batch, num_threads=HNSW_INDEX_BUILD_THREADS)
         
-        # TODO: Step 3 - Return similar user IDs (or actual recommendations)
-        return similar_users
+        # Set query-time parameters
+        self.user_similarity_index.set_ef(HNSW_INDEX_EF_QUERY)  
 
-    def _get_user_vector(self, user_id: int):
+    def __save_model(self):
         """
-        Get the feature vector for a given user.
+        Save the model to disk. This includes the ratings_df, HNSW index, user and movie ID mappings, and the ALS model.
+        """
+        # Delete the directory if it already exists
+        if os.path.exists(MODEL_OUTPUT_PATH):
+            import shutil
+            shutil.rmtree(MODEL_OUTPUT_PATH)
+
+        # Ensure the output directory exists
+        os.makedirs(MODEL_OUTPUT_PATH, exist_ok=True)
+
+        # Save self.user_ratings_dict to disk
+        np.savez_compressed(
+            USER_RATINGS_DICT_PATH,
+            user_ratings_dict=self.user_ratings_dict
+        )
+
+        # Save the HNSW index to disk
+        self.user_similarity_index.save_index(HNSW_INDEX_PATH)
+
+        # Save user and movie ID mappings
+        np.savez_compressed(
+            USER_MOVIE_MAPPINGS_PATH,
+            user_id_to_index=self.user_id_to_index,
+            index_to_user_id=self.index_to_user_id,
+            movie_id_to_index=self.movie_id_to_index,
+            index_to_movie_id=self.index_to_movie_id
+        )
+
+        # Save embedding vectors
+        np.savez_compressed(
+            USER_VECTORS_PATH,
+            user_vectors=self.user_vectors
+        )
+
+        # Save the ALS model
+        with open(ALS_MODEL_PATH, "wb") as f:
+            pickle.dump(self.als_model, f)
+
+    def __recommend_movies(self, watched_movies, labels, distances):
+        """
+        Recommend movies based on the watched movies and similar users.
         
-        :param user_id: The user ID
-        :return: A feature vector representing the user
+        :param watched_movies: List of movie IDs that the user has watched.
+        :param labels: Indices of similar users.
+        :param distances: Distances to the similar users.
+        :return: List of recommended movie IDs.
         """
-        # TODO: Implement this method to extract the feature vector for the given user
-        print(f"Getting vector for user {user_id}...")
-        return np.random.rand(1, 50)  # Placeholder: Return random vector for now
+        # Sort similar users by distance
+        sorted_indices = np.argsort(distances[0])
+        sorted_labels = labels[0][sorted_indices]
+        sorted_distances = distances[0][sorted_indices]
 
-    def _get_similar_users(self, user_vector, k):
-        """
-        Get the most similar users to the given user.
+        recommended_movies = {}
+        for idx, user_index in enumerate(sorted_labels):
+            user_id = self.index_to_user_id[user_index]
+            user_ratings = self.user_ratings_dict[user_id]
+            # Get the movie IDs and ratings for the user
+            for movie_id, rating in user_ratings:
+                # Check if the movie is already watched
+                if movie_id not in watched_movies:
+                    if movie_id not in recommended_movies:
+                        recommended_movies[movie_id] = 0
+                    # Weight by proximity and the rating
+                    recommended_movies[movie_id] += (rating) * (1 / (1 + sorted_distances[idx]))
 
-        :param user_vector: The feature vector for the user
-        :param k: The number of similar users to return
-        :return: List of similar user IDs
+        # Sort recommendations by score
+        recommended_movies = sorted(recommended_movies.items(), key=lambda x: x[1], reverse=True)
+
+        # Make tuple of movie ID and score
+        recommended_movies = [(movie_id, score) for movie_id, score in recommended_movies[:TOP_K]]
+        return recommended_movies
+
+    def load_model(self):
         """
-        # TODO: Implement this method to query the FAISS index and return k similar users
-        print(f"Finding {k} similar users...")
-        distances, indices = self.user_similarity_index.search(user_vector.astype(np.float32), k)
-        return indices[0]  # Return the indices of similar users (placeholder)
+        Load the model from disk. This includes the ratings_df, HNSW index, user and movie ID mappings, and the ALS model.
+        """
+        # Check if the model output path exists
+        if not os.path.exists(MODEL_OUTPUT_PATH):
+            raise FileNotFoundError(f"Model output path {MODEL_OUTPUT_PATH} does not exist. Please build the model first.")
+        
+        # Load the user ratings dictionary from disk
+        user_ratings_dict = np.load(USER_RATINGS_DICT_PATH, allow_pickle=True)
+        self.user_ratings_dict = user_ratings_dict["user_ratings_dict"].item()
+        
+        # Load the HNSW index from disk
+        self.user_similarity_index = hnswlib.Index(space=HNSW_INDEX_SPACE, dim=VECTOR_DIM)
+        self.user_similarity_index.load_index(HNSW_INDEX_PATH)
+
+        # Load user and movie ID mappings
+        mappings = np.load(USER_MOVIE_MAPPINGS_PATH, allow_pickle=True)
+        self.user_id_to_index = mappings["user_id_to_index"].item()
+        self.index_to_user_id = mappings["index_to_user_id"].item()
+        self.movie_id_to_index = mappings["movie_id_to_index"].item()
+        self.index_to_movie_id = mappings["index_to_movie_id"].item()
+
+        # Load embedding vectors
+        user_vectors = np.load(USER_VECTORS_PATH, allow_pickle=True)["user_vectors"]
+        self.user_vectors = user_vectors
+
+        # Load the ALS model
+        with open(ALS_MODEL_PATH, "rb") as f:
+            self.als_model = pickle.load(f)
+
+        print(f"[Load Model] Successfully loaded model from {MODEL_OUTPUT_PATH}")
+
+    def build_model(self):
+        """
+        Build the user-user similarity model using FAISS.
+        
+        This should create the FAISS index for fast user similarity lookup.
+        """
+        # Load and preprocess data
+        print(f"[Build Model] Loading data from {RATINGS_FILE}")
+        data_loader = CSVDataLoader(RATINGS_FILE)
+        self.ratings_df = data_loader.load_data()
+        print(f"[Build Model] Successfully loaded data with shape {self.ratings_df.shape}")
+
+        # Store a dictionary to fast fetch movies and ratings by userID
+        print(f"[Build Model] Building user ratings dictionary")
+        self.user_ratings_dict = {}
+        grouped = self.ratings_df.group_by("userId").agg([
+            pl.col("movieId"),
+            pl.col("rating")
+        ])
+        for row in grouped.iter_rows():
+            user_id = row[0]
+            movie_ids = row[1]
+            ratings = row[2]
+            self.user_ratings_dict[user_id] = list(zip(movie_ids, ratings))
+        print(f"[Build Model] Successfully built user ratings dictionary with {len(self.user_ratings_dict)} users")
+
+        # Preprocess data
+        print(f"[Build Model] Preprocessing data...")
+        self.ratings_df = self.__preprocess_data(self.ratings_df)
+        print(f"[Build Model] Successfully preprocessed data with shape {self.ratings_df.shape}")
+
+        # Prepare User Movie Sparse Matrix
+        print("[Build Model] Fitting ALS for User Embeddings")
+        self.user_vectors = self.__prepare_user_vectors(self.ratings_df)
+        print(f"[Build Model] Successfully built User Embedding of shape {self.user_vectors.shape}")
+
+        # Build HNSW Index
+        print(f"[Build Model] Building HNSW Index")
+        self.__build_hnsw_index(self.user_vectors)
+        print(f"[Build Model] HNSW Index built")
+
+        # TODO: Save Model In Disk
+        print(f"[Build Model] Saving model in disk")
+        self.__save_model()
+        print(f"[Build Model] Successfully saved model at {MODEL_OUTPUT_PATH}")
+
+    def __inference_user_id(self, user_id: int):
+        """
+        Perform inference to get recommendations for a given user ID.
+        
+        :param user_id: The user ID for which to get recommendations.
+        :return: List of recommended movie IDs.
+        """
+        if self.user_similarity_index is None:
+            raise ValueError("Model not built. Please call build_model() first.")
+
+        if user_id not in self.user_id_to_index:
+            raise ValueError(f"User ID {user_id} not found in the model.")
+
+        # Get the index of the user
+        user_index = self.user_id_to_index[user_id]
+
+        # Get the top K similar users
+        labels, distances = self.user_similarity_index.knn_query(self.user_vectors[user_index], k=TOP_K)
+        print(f"[Inference] Similar user labels: {labels}")
+        
+        # Get the watched movies of the user
+        watched_movies = self.user_ratings_dict[user_id]
+        watched_movies = [movie_id for movie_id, _ in watched_movies]
+        print(f"[Inference] Watched movies: {watched_movies}")
+
+        # Recommend movies based on the watched movies and similar users
+        recommended_movies = self.__recommend_movies(watched_movies, labels, distances)
+        print(f"[Inference] Recommended movies: {recommended_movies}")
+        return recommended_movies
+
+    def __inference_watched_movies(self, watched_movies: list):
+        """
+        Perform inference to get recommendations for a given list of watched movies.
+        """
+        if self.user_similarity_index is None:
+            raise ValueError("Model not built. Please call build_model() first.")
+
+        # Convert watched movies to indices
+        watched_movie_indices = [self.movie_id_to_index[movie_id] for movie_id in watched_movies if movie_id in self.movie_id_to_index]
+        if not watched_movie_indices:
+            raise ValueError("None of the watched movies are in the model.")
+
+        # Create a user vector for the watched movies
+        user_vector = np.zeros((1, len(self.movie_id_to_index)), dtype=np.float32)
+        user_vector[0, watched_movie_indices] = 1.0  # Assuming binary representation for watched movies
+        user_vector = np.ascontiguousarray(user_vector)
+        print(f"[Inference] User vector shape: {user_vector.shape}")
+
+        # Get embedding for this user vector
+        user_vector_embedding = self.als_model.item_factors.T.dot(user_vector.T).T
+        user_vector_embedding = np.ascontiguousarray(user_vector_embedding)
+        norms = np.linalg.norm(user_vector_embedding, axis=1, keepdims=True)
+        user_vector_embedding /= np.where(norms == 0, 1e-10, norms)
+        user_vector_embedding = user_vector_embedding.reshape(1, -1)
+        print(f"[Inference] User vector embedding shape: {user_vector_embedding.shape}")
+
+        # Get the top K similar users
+        labels, distances = self.user_similarity_index.knn_query(user_vector_embedding, k=TOP_K)
+        print(f"[Inference] Similar user labels: {labels}")
+
+        # Recommend movies based on the watched movies and similar users
+        recommended_movies = self.__recommend_movies(watched_movies, labels, distances)
+        print(f"[Inference] Recommended movies: {recommended_movies}")
+        return recommended_movies
+
+    def inference(self, type: str, user_id: int = None, watched_movies: list = None):
+        """
+        Perform inference to get recommendations for a given user ID or watched movies.
+        
+        :param type: Type of inference ('user_id' or 'watched_movies').
+        :param user_id: The user ID for which to get recommendations (if type is 'user_id').
+        :param watched_movies: List of movie IDs that the user has watched (if type is 'watched_movies').
+        :return: List of recommended movie IDs.
+        """
+        if type == "user_id":
+            return self.__inference_user_id(user_id)
+        elif type == "watched_movies":
+            return self.__inference_watched_movies(watched_movies)
+        else:
+            raise ValueError("Invalid inference type. Use 'user_id' or 'watched_movies'.")
