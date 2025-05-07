@@ -40,8 +40,9 @@ class Utils:
         tmdb_movies_df = CSVDataLoader(MOVIES_FILE).load_lazy_data()
         
         # Join on TMDB ID
-        merged_df = links_df.join(tmdb_movies_df, left_on="tmdbId", right_on="id", how="inner")
-        
+        merged_df = links_df.join(tmdb_movies_df, left_on="tmdbId", right_on="id", how="inner").collect()
+        print(f"[Utils] Merged DataFrame columns: {merged_df.columns}")
+
         # Create a dictionary mapping movie IDs to their details (All columns except 'id')
         movie_details_dict = {}
         for row in merged_df.iter_rows():
