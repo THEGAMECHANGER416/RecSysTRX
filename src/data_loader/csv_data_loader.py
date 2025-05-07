@@ -14,3 +14,12 @@ class CSVDataLoader(BaseLoader):
         df = pl.read_csv(self.data_path, columns=columns)
         print(f"[CSVDataLoader] Loaded shape: {df.shape[0]} rows × {df.shape[1]} columns")
         return df
+
+    def load_lazy_data(self, columns=None) -> pl.LazyFrame:
+        if not self.data_path.exists():
+            raise FileNotFoundError(f"[CSVDataLoader] File not found: {self.data_path}")
+
+        print(f"[CSVDataLoader] Loading lazy data from: {self.data_path}")
+        lazy_df = pl.scan_csv(self.data_path, columns=columns)
+        print(f"[CSVDataLoader] Loaded lazy shape: {lazy_df.collect().shape[0]} rows × {lazy_df.collect().shape[1]} columns")
+        return lazy_df

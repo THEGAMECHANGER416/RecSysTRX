@@ -6,6 +6,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(PROJECT_ROOT, ".."))  # move up to p
 
 RATINGS_FILE = os.path.join(PROJECT_ROOT, "data", "ml-32m", "ratings.csv")
 MOVIES_FILE = os.path.join(PROJECT_ROOT, "data", "tmdb_dataset", "TMDB_movie_dataset_v11.csv")
+LINKS_FILE = os.path.join(PROJECT_ROOT, "data", "ml-32m", "links.csv")
 
 # For FAISS or vector settings
 VECTOR_DIM = 100
@@ -15,9 +16,9 @@ FAISS_INDEX_TYPE = "IndexFlatIP"  # or "IndexFlatL2"
 TOP_K = 10  # [10] Number of recommendations to retrieve
 
 # ALS Settings
-ALS_FACTORS = 64 # [64]
-ALS_ITERATIONS = 2 # [15]
-ALS_REGULARIZATION = 0.1 # [0.1]
+ALS_FACTORS = 72 # [64]
+ALS_ITERATIONS = 15 # [15]
+ALS_REGULARIZATION = 0.15 # [0.1]
 
 # HNSW Index Settings
 HNSW_INDEX_SPACE = 'cosine'
@@ -35,3 +36,5 @@ ALS_MODEL_PATH = os.path.join(MODEL_OUTPUT_PATH, "als_model.pkl")
 USER_VECTORS_PATH = os.path.join(MODEL_OUTPUT_PATH, "user_vectors.npz")
 RATINGS_DATASET_PATH = os.path.join(MODEL_OUTPUT_PATH, "ratings_dataset.csv")
 USER_RATINGS_DICT_PATH = os.path.join(MODEL_OUTPUT_PATH, "user_ratings_dict.npz")
+
+PROXIMITY_INFLUENCE_FACTOR = 0.5  # [0.5] Factor to influence the proximity during recommendations (lesser value = more influence of ratings)

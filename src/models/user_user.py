@@ -2,6 +2,7 @@ from .base import BaseRecommender
 from src.data_loader import CSVDataLoader
 from src.data_preprocessing import RatingsDataPreprocessor
 from src.config import *
+from src.utils import Utils
 import numpy as np
 from implicit.als import AlternatingLeastSquares
 import polars as pl
@@ -18,6 +19,7 @@ class UserUserRecommender(BaseRecommender):
         """
         self.ratings_df = None
         self.user_ratings_dict = None
+        self.movie_details_dict = None
 
         self.user_similarity_index = None
         self.user_vectors = None
@@ -30,12 +32,18 @@ class UserUserRecommender(BaseRecommender):
 
         self.als_model = None
     
-    def __preprocess_data(self, ratings_df):
-        preprocessor = RatingsDataPreprocessor(ratings_df)
+    def __preprocess_data(self):
+        print(f"[Preprocess Data] Preprocessing data...")
+        preprocessor = RatingsDataPreprocessor(self.ratings_df)
+        print(f"[Preprocess Data] Successfully loaded data with shape {self.ratings_df.shape}")
         preprocessor.clean()
+        print(f"[Preprocess Data] Successfully cleaned data with shape {self.ratings_df.shape}")
         preprocessor.handle_missing_values()
+        print(f"[Preprocess Data] Successfully handled missing values with shape {self.ratings_df.shape}")
         preprocessor.transform()
-        return preprocessor.df
+        print(f"[Preprocess Data] Successfully transformed data with shape {self.ratings_df.shape}")
+        self.ratings_df = preprocessor.df
+        print(f"[Preprocess Data] Successfully preprocessed data with shape {self.ratings_df.shape}")
         
     def __prepare_user_vectors(self, ratings_df):
         # Convert to efficient types
@@ -124,7 +132,8 @@ class UserUserRecommender(BaseRecommender):
         # Save self.user_ratings_dict to disk
         np.savez_compressed(
             USER_RATINGS_DICT_PATH,
-            user_ratings_dict=self.user_ratings_dict
+            user_ratings_dict=self.user_ratings_dict,
+            movie_details_dict=self.movie_details_dict
         )
 
         # Save the HNSW index to disk
@@ -158,6 +167,8 @@ class UserUserRecommender(BaseRecommender):
         :param distances: Distances to the similar users.
         :return: List of recommended movie IDs.
         """
+        watched_movies_set = set(watched_movies)
+
         # Sort similar users by distance
         sorted_indices = np.argsort(distances[0])
         sorted_labels = labels[0][sorted_indices]
@@ -170,11 +181,12 @@ class UserUserRecommender(BaseRecommender):
             # Get the movie IDs and ratings for the user
             for movie_id, rating in user_ratings:
                 # Check if the movie is already watched
-                if movie_id not in watched_movies:
+                if movie_id not in watched_movies_set:
                     if movie_id not in recommended_movies:
                         recommended_movies[movie_id] = 0
                     # Weight by proximity and the rating
-                    recommended_movies[movie_id] += (rating) * (1 / (1 + sorted_distances[idx]))
+                    proximity_weight = (1 / (1 + sorted_distances[idx]))
+                    recommended_movies[movie_id] += rating * np.power(proximity_weight, PROXIMITY_INFLUENCE_FACTOR)
 
         # Sort recommendations by score
         recommended_movies = sorted(recommended_movies.items(), key=lambda x: x[1], reverse=True)
@@ -194,7 +206,8 @@ class UserUserRecommender(BaseRecommender):
         # Load the user ratings dictionary from disk
         user_ratings_dict = np.load(USER_RATINGS_DICT_PATH, allow_pickle=True)
         self.user_ratings_dict = user_ratings_dict["user_ratings_dict"].item()
-        
+        self.movie_details_dict = user_ratings_dict["movie_details_dict"].item()
+
         # Load the HNSW index from disk
         self.user_similarity_index = hnswlib.Index(space=HNSW_INDEX_SPACE, dim=VECTOR_DIM)
         self.user_similarity_index.load_index(HNSW_INDEX_PATH)
@@ -228,24 +241,20 @@ class UserUserRecommender(BaseRecommender):
         self.ratings_df = data_loader.load_data()
         print(f"[Build Model] Successfully loaded data with shape {self.ratings_df.shape}")
 
-        # Store a dictionary to fast fetch movies and ratings by userID
-        print(f"[Build Model] Building user ratings dictionary")
-        self.user_ratings_dict = {}
-        grouped = self.ratings_df.group_by("userId").agg([
-            pl.col("movieId"),
-            pl.col("rating")
-        ])
-        for row in grouped.iter_rows():
-            user_id = row[0]
-            movie_ids = row[1]
-            ratings = row[2]
-            self.user_ratings_dict[user_id] = list(zip(movie_ids, ratings))
-        print(f"[Build Model] Successfully built user ratings dictionary with {len(self.user_ratings_dict)} users")
-
         # Preprocess data
         print(f"[Build Model] Preprocessing data...")
-        self.ratings_df = self.__preprocess_data(self.ratings_df)
+        self.__preprocess_data()
         print(f"[Build Model] Successfully preprocessed data with shape {self.ratings_df.shape}")
+
+        # Store a dictionary to fast fetch movies and ratings by userID
+        print(f"[Build Model] Building user ratings dictionary")
+        self.user_ratings_dict = Utils.build_user_ratings_dict(self.ratings_df)
+        print(f"[Build Model] Successfully built user ratings dictionary with {len(self.user_ratings_dict)} users")
+
+        # Store a dictionary to fast fetch movie details by movieID
+        print(f"[Build Model] Building movie details dictionary")
+        self.movie_details_dict = Utils.build_movie_details_dict()
+        print(f"[Build Model] Successfully built movie details dictionary with {len(self.movie_details_dict)} movies")
 
         # Prepare User Movie Sparse Matrix
         print("[Build Model] Fitting ALS for User Embeddings")
@@ -295,36 +304,46 @@ class UserUserRecommender(BaseRecommender):
     def __inference_watched_movies(self, watched_movies: list):
         """
         Perform inference to get recommendations for a given list of watched movies.
+
+        :param watched_movies: List of movie IDs that the user has watched.
+        :return: List of recommended movie IDs with scores.
         """
-        if self.user_similarity_index is None:
-            raise ValueError("Model not built. Please call build_model() first.")
+        if self.user_similarity_index is None or self.als_model is None:
+            raise ValueError("Model not built or loaded. Please call build_model() or load_model() first.")
 
-        # Convert watched movies to indices
-        watched_movie_indices = [self.movie_id_to_index[movie_id] for movie_id in watched_movies if movie_id in self.movie_id_to_index]
+        # Convert watched movies to indices and filter out movies not in the model
+        watched_movie_indices = [
+            self.movie_id_to_index[movie_id] for movie_id in watched_movies
+            if movie_id in self.movie_id_to_index
+        ]
+
         if not watched_movie_indices:
-            raise ValueError("None of the watched movies are in the model.")
+            print("Warning: None of the watched movies are in the model. Cannot generate recommendations.")
+            return [] # Return empty list if no watched movies are in the model
 
-        # Create a user vector for the watched movies
-        user_vector = np.zeros((1, len(self.movie_id_to_index)), dtype=np.float32)
-        user_vector[0, watched_movie_indices] = 1.0  # Assuming binary representation for watched movies
-        user_vector = np.ascontiguousarray(user_vector)
-        print(f"[Inference] User vector shape: {user_vector.shape}")
+        # --- Corrected Approach: Average Item Factors ---
+        # Get the item factors for the watched movies
+        item_factors = self.als_model.item_factors[watched_movie_indices]
 
-        # Get embedding for this user vector
-        user_vector_embedding = self.als_model.item_factors.T.dot(user_vector.T).T
+        # Compute the average item factor vector to represent the user
+        user_vector_embedding = np.mean(item_factors, axis=0).reshape(1, -1)
+
+        # Normalize the user vector embedding
         user_vector_embedding = np.ascontiguousarray(user_vector_embedding)
         norms = np.linalg.norm(user_vector_embedding, axis=1, keepdims=True)
-        user_vector_embedding /= np.where(norms == 0, 1e-10, norms)
-        user_vector_embedding = user_vector_embedding.reshape(1, -1)
-        print(f"[Inference] User vector embedding shape: {user_vector_embedding.shape}")
+        # Avoid division by zero for zero vectors
+        user_vector_embedding /= (norms + 1e-10)
 
-        # Get the top K similar users
+        print(f"[Inference Watched Movies] User vector embedding shape: {user_vector_embedding.shape}")
+
+        # Get the top K similar users using the HNSW index
+        # HNSW knn_query returns labels (indices) and distances
         labels, distances = self.user_similarity_index.knn_query(user_vector_embedding, k=TOP_K)
-        print(f"[Inference] Similar user labels: {labels}")
+        print(f"[Inference Watched Movies] Similar user labels: {labels}")
 
         # Recommend movies based on the watched movies and similar users
         recommended_movies = self.__recommend_movies(watched_movies, labels, distances)
-        print(f"[Inference] Recommended movies: {recommended_movies}")
+        print(f"[Inference Watched Movies] Recommended movies: {recommended_movies}")
         return recommended_movies
 
     def inference(self, type: str, user_id: int = None, watched_movies: list = None):

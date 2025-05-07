@@ -6,10 +6,13 @@ class RatingsDataPreprocessor(DataPreprocessor):
         """
         Perform cleaning operations like removing duplicates and unnecessary columns.
         """
-        initial_count = self.df.shape[0]
-        self.df = self.df.unique(subset=["userId", "movieId"])
-        final_count = self.df.shape[0]
-        print(f"[Clean] Removed {initial_count - final_count} duplicate rows.")
+        try:
+            initial_count = self.df.shape[0]
+            self.df = self.df.unique(subset=["userId", "movieId"])
+            final_count = self.df.shape[0]
+            print(f"[Clean] Removed {initial_count - final_count} duplicate rows.")
+        except Exception as e:
+            print(f"[Clean] Error while removing duplicates: {e}")
 
     def transform(self):
         """
