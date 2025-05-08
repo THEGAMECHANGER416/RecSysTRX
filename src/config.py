@@ -4,9 +4,9 @@ import os
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))  # src/config.py location
 PROJECT_ROOT = os.path.abspath(os.path.join(PROJECT_ROOT, ".."))  # move up to project root
 
-RATINGS_FILE = os.path.join(PROJECT_ROOT, "data", "ml-32m", "ratings.csv")
-MOVIES_FILE = os.path.join(PROJECT_ROOT, "data", "tmdb_dataset", "TMDB_movie_dataset_v11.csv")
-LINKS_FILE = os.path.join(PROJECT_ROOT, "data", "ml-32m", "links.csv")
+RATINGS_FILE = os.path.join(PROJECT_ROOT, "data", "raw", "ml-32m", "ratings.csv")
+MOVIES_FILE = os.path.join(PROJECT_ROOT, "data", "raw", "tmdb_dataset", "TMDB_movie_dataset_v11.csv")
+LINKS_FILE = os.path.join(PROJECT_ROOT, "data", "raw", "ml-32m", "links.csv")
 
 # For FAISS or vector settings
 VECTOR_DIM = 100
