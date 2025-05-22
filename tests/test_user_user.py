@@ -5,5 +5,6 @@ def run_user_user_pipeline():
     model = UserUserRecommender(RATINGS_FILE)
     model.build_model()
 
+# Main
 if __name__ == "__main__":
     run_user_user_pipeline()
